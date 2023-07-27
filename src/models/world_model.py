@@ -85,7 +85,6 @@ class WorldModel(nn.Module):
         prev_steps = 0 if past_keys_values is None else past_keys_values.size
 
         sequences = self.embedder(tokens, num_steps, prev_steps) + self.pos_emb(prev_steps + torch.arange(num_steps, device=tokens.device))
-
         x = self.transformer(sequences, past_keys_values)
 
         logits_observations = self.head_observations(x, num_steps=num_steps, prev_steps=prev_steps)
@@ -95,15 +94,24 @@ class WorldModel(nn.Module):
         return WorldModelOutput(x, logits_observations, logits_rewards, logits_ends)
 
     def compute_loss(self, batch: Batch, tokenizer: Tokenizer, **kwargs: Any) -> LossWithIntermediateLosses:
+        # observations (B, L, C, H, W)
+        # actions (B, L, )
 
         with torch.no_grad():
+            # obs tokens (B, L, K)
             obs_tokens = tokenizer.encode(batch['observations'], should_preprocess=True).tokens  # (BL, K)
-
+        
+        # act tokens (B, L, 1)
         act_tokens = rearrange(batch['actions'], 'b l -> b l 1')
+
+        # tokens (B, L, L * (K + 1))
         tokens = rearrange(torch.cat((obs_tokens, act_tokens), dim=2), 'b l k1 -> b (l k1)')  # (B, L(K+1))
 
-        outputs = self(tokens)
 
+        # output_logits (B, L * K, N)
+        # output sequence (B, L * (K + 1), E)
+        outputs = self(tokens)
+   
         labels_observations, labels_rewards, labels_ends = self.compute_labels_world_model(obs_tokens, batch['rewards'], batch['ends'], batch['mask_padding'])
 
         logits_observations = rearrange(outputs.logits_observations[:, :-1], 'b t o -> (b t) o')

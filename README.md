@@ -129,3 +129,15 @@ Pretrained models are available [here](https://github.com/eloialonso/iris_pretra
 - [https://github.com/CompVis/taming-transformers](https://github.com/CompVis/taming-transformers)
 - [https://github.com/karpathy/minGPT](https://github.com/karpathy/minGPT)
 - [https://github.com/google-research/rliable](https://github.com/google-research/rliable)
+
+## Notes
+
+- This code is tested with `python 3.9`
+
+```bash
+bash ./scripts/test.sh
+```
+
+```bash
+python src/main.py env.train.id=BreakoutNoFrameskip-v4 common.device=cpu wandb.mode=disabled
+```

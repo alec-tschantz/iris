@@ -5,6 +5,7 @@ header=0
 reconstruction=0
 save_mode=0
 mode="agent_in_env"
+device="cpu"
 
 while [ "$1" != "" ]; do
     case $1 in
@@ -37,4 +38,4 @@ while [ "$1" != "" ]; do
     shift
 done
 
-python src/play.py hydra.run.dir=. hydra.output_subdir=null +mode="${mode}" +fps="${fps}" +header="${header}" +reconstruction="${reconstruction}" +save_mode="${save_mode}"
+python src/play.py common.device=${device} hydra.run.dir=. hydra.output_subdir=null +mode="${mode}" +fps="${fps}" +header="${header}" +reconstruction="${reconstruction}" +save_mode="${save_mode}"
