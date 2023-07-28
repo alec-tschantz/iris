@@ -5,6 +5,8 @@ outputs
 results/figures
 slurm*
 experiments
+checkpoints/
+media/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
