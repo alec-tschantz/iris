@@ -1,10 +1,10 @@
 from pathlib import Path
+from typing import Tuple
 
 import numpy as np
 from einops import rearrange
 
 import torch
-from torch.distributions.categorical import Categorical
 import torch.nn as nn
 
 from models.actor_critic import ActorCritic
@@ -30,9 +30,7 @@ class MCTSAgent(nn.Module):
         self.tokenizer = tokenizer
         self.world_model = world_model
         self.actor_critic = actor_critic
-        self.keys_values_wm = None
-        self.num_observations_tokens = None
-        self.obs_token = None
+        self.tokens = []
 
     @property
     def device(self):
@@ -54,71 +52,60 @@ class MCTSAgent(nn.Module):
         if load_actor_critic:
             self.actor_critic.load_state_dict(extract_state_dict(agent_state_dict, "actor_critic"))
 
-    @torch.no_grad()
-    def refresh_keys_values_with_initial_obs_tokens(self, obs_tokens: torch.LongTensor) -> torch.FloatTensor:
-        n, num_observations_tokens = obs_tokens.shape
-        assert num_observations_tokens == self.num_observations_tokens
-        self.keys_values_wm = self.world_model.transformer.generate_empty_keys_values(
-            n=n, max_tokens=self.world_model.config.max_tokens
-        )
-        outputs_wm = self.world_model(obs_tokens, past_keys_values=self.keys_values_wm)
-         # (B, K, E)
-        return outputs_wm.output_sequence 
+    def decode_obs_tokens(self, obs_tokens: torch.LongTensor) -> torch.FloatTensor:
+        num_obs_tokens = obs_tokens.shape[1]
+        # (B, K) -> (B, K, E)
+        embedded_tokens = self.tokenizer.embedding(obs_tokens)
+        z = rearrange(embedded_tokens, "b (h w) e -> b e h w", h=int(np.sqrt(num_obs_tokens)))
+        # (B, C, H, W)
+        obs = self.tokenizer.decode(z, should_postprocess=True)
+        return torch.clamp(obs, 0, 1)
 
-    @torch.no_grad()
-    def reset_from_initial_observations(self, observations: torch.FloatTensor) -> None:
-         # (B, C, H, W) -> (B, K)
-        obs_tokens = self.tokenizer.encode(observations, should_preprocess=True).tokens 
-        _, num_observations_tokens = obs_tokens.shape
-        if self.num_observations_tokens is None:
-            self.num_observations_tokens = num_observations_tokens
+    def predict_next_obs_tokens(
+        self, tokens: torch.LongTensor, num_tokens: int, temperature: float = 1.0
+    ) -> torch.LongTensor:
+        for _ in range(num_tokens):
+            # (B, T, N)
+            logits = self.world_model(tokens).logits_observations
+            # (B, N)
+            logits = logits[:, -1, :] / temperature
+            # (B, N)
+            probs = torch.nn.functional.softmax(logits, dim=-1)
+            # (B, )
+            _, idx_next = torch.topk(probs, k=1, dim=-1)
+            # (B, T + 1)
+            tokens = torch.cat((tokens, idx_next), dim=1)
 
-        _ = self.refresh_keys_values_with_initial_obs_tokens(obs_tokens)
-        self.obs_tokens = obs_tokens
+        # (B, K)
+        return tokens[:, -num_tokens:]
 
-    def act(self, obs: torch.FloatTensor, should_sample: bool = True, temperature: float = 1.0, depth: int = 0) -> torch.LongTensor:
-        # obs (B, C, H, W) in [0, 1]
+    def step(self, obs: torch.FloatTensor, temperature: float = 1.0) -> Tuple[torch.LongTensor, torch.FloatTensor]:
+        # (B, C, H, W) -> (B, K)
+        obs_tokens = self.tokenizer.encode(obs, should_preprocess=True).tokens
+        num_obs_tokens = obs_tokens.shape[1]
+        max_blocks = self.world_model.config.max_blocks
 
-        # ==== get action from actor critic ====
-        # logits_actions (B, A)
+        # (B, A)
         logits_actions = self.actor_critic(obs).logits_actions[:, -1] / temperature
-        # act_token (1)
-        act_token = Categorical(logits=logits_actions).sample() if should_sample else logits_actions.argmax(dim=-1)
+        # (B, )
+        act_tokens = logits_actions.argmax(dim=-1)
 
-        # ==== check if this is initial observation ====
-        if self.keys_values_wm is None:
-            self.reset_from_initial_observations(obs)
+        # (B, K + 1)
+        tokens = torch.cat((obs_tokens, act_tokens.reshape(-1, 1)), dim=1)
 
-        # ==== predict next tokens ====
-        output_sequence, obs_tokens = [], []
-        num_passes = 1 + self.num_observations_tokens
-        # act_token_wm (B, 1)
-        act_token_wm = act_token.reshape(-1, 1)
+        # [(B, T)]
+        self.tokens.append(tokens)
 
-        if self.keys_values_wm.size + num_passes > self.world_model.config.max_tokens:
-            _ = self.refresh_keys_values_with_initial_obs_tokens(self.obs_tokens)
+        if len(self.tokens) >= max_blocks - 1:
+            self.tokens = self.tokens[-max_blocks + 1 :]
 
-        for k in range(num_passes):
-            outputs_wm = self.world_model(act_token_wm, past_keys_values=self.keys_values_wm)
-            output_sequence.append(outputs_wm.output_sequence)
+        # (B, T)
+        tokens = torch.cat(self.tokens, dim=1)
 
-            if k < self.num_observations_tokens:
-                token = Categorical(logits=outputs_wm.logits_observations).sample()
-                obs_tokens.append(token)
+        # (B, K)
+        next_obs_tokens = self.predict_next_obs_tokens(tokens, num_obs_tokens)
 
-        # output sequence (B, 1 + K, E)
-        output_sequence = torch.cat(output_sequence, dim=1)
-        # obs_tokens (B, K)
-        self.obs_tokens = torch.cat(obs_tokens, dim=1)
+        # (B, C, H, W)
+        next_obs = self.decode_obs_tokens(next_obs_tokens)
 
-        # ==== decode observation ====
-        embedded_tokens = self.tokenizer.embedding(self.obs_tokens)     # (B, K, E)
-        z = rearrange(embedded_tokens, 'b (h w) e -> b e h w', h=int(np.sqrt(self.num_observations_tokens)))
-        rec = self.tokenizer.decode(z, should_postprocess=True)         # (B, C, H, W)
-        obs = torch.clamp(rec, 0, 1)
-
-        # if depth < 10:
-        #     _ = self.act(obs, should_sample=should_sample, temperature=temperature, depth=depth + 1)
-
-        return act_token
-
+        return act_tokens, next_obs

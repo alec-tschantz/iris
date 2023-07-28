@@ -104,7 +104,7 @@ class WorldModel(nn.Module):
         # act tokens (B, L, 1)
         act_tokens = rearrange(batch['actions'], 'b l -> b l 1')
 
-        # tokens (B, L, L * (K + 1))
+        # tokens (B, L * (K + 1))
         tokens = rearrange(torch.cat((obs_tokens, act_tokens), dim=2), 'b l k1 -> b (l k1)')  # (B, L(K+1))
 
 
